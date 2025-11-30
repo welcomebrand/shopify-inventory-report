@@ -1,16 +1,12 @@
-
 /* =====================================================================
-   Shopify Inventory Report API (Universal / No Special Permissions)
-   - Uses inventory_levels + inventory_item adjustments
-   - Reconstructs daily inventory levels
-   - Safe for all Shopify plans and API versions
+   Shopify Inventory Report API (Diagnostic-Safe Version)
 ===================================================================== */
 
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
 
-/* ---------- CORS (same as knife-sales-stats) ---------- */
+/* ---------- CORS ---------- */
 function applyCors(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -23,7 +19,7 @@ function applyCors(req, res) {
   return false;
 }
 
-/* ---------- Caching (same as knife-sales-stats) ---------- */
+/* ---------- Cache ---------- */
 function applyCache(res) {
   res.setHeader(
     "Cache-Control",
@@ -32,6 +28,16 @@ function applyCache(res) {
 }
 
 /* ---------- Date Helpers ---------- */
+function enumerateDays(start, end) {
+  const out = [];
+  const d = new Date(start);
+  while (d <= end) {
+    out.push(d.toISOString().slice(0, 10));
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
 function getMonthsAgoRange(rangeParam) {
   const months = Number(rangeParam) || 24;
 
@@ -39,27 +45,15 @@ function getMonthsAgoRange(rangeParam) {
   const start = new Date();
   start.setMonth(start.getMonth() - months);
 
-  const iso = (d) => d.toISOString();
-  const day = (d) => iso(d).slice(0, 10);
+  const fmt = (d) => d.toISOString().slice(0, 10);
 
   return {
     start,
     end,
-    startDay: day(start),
-    endDay: day(end),
+    startDay: fmt(start),
+    endDay: fmt(end),
     months,
   };
-}
-
-function enumerateDays(start, end) {
-  const days = [];
-  const d = new Date(start);
-
-  while (d <= end) {
-    days.push(d.toISOString().slice(0, 10));
-    d.setDate(d.getDate() + 1);
-  }
-  return days;
 }
 
 /* ---------- Shopify REST Helper ---------- */
@@ -78,16 +72,18 @@ async function shopifyGET(path, params = {}) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`Shopify REST error: ${res.status} ${txt}`);
+    throw new Error(
+      `Shopify REST ${res.status}: ${txt}`
+    );
   }
 
   return res.json();
 }
 
-/* ---------- Step 1: Fetch variants + inventory_item_ids ---------- */
+/* ---------- Step 1: Fetch Variants ---------- */
 async function fetchAllVariants() {
-  let pageInfo = null;
   const variants = [];
+  let pageInfo = null;
 
   while (true) {
     const params = {
@@ -102,7 +98,6 @@ async function fetchAllVariants() {
       for (const v of p.variants || []) {
         if (v.sku && v.inventory_item_id) {
           variants.push({
-            variantId: v.id,
             sku: v.sku,
             inventoryItemId: v.inventory_item_id,
           });
@@ -110,8 +105,8 @@ async function fetchAllVariants() {
       }
     }
 
-    const link = json.headers?.link || res.headers?.get("link");
-    if (!link || !link.includes('rel="next"')) break;
+    const link = json.headers?.link || "";
+    if (!link.includes('rel="next"')) break;
 
     const match = link.match(/page_info=([^&>]+)/);
     if (!match) break;
@@ -122,7 +117,7 @@ async function fetchAllVariants() {
   return variants;
 }
 
-/* ---------- Step 2: Fetch inventory adjustments per inventory_item ---------- */
+/* ---------- Step 2: Inventory Adjustments ---------- */
 async function fetchAdjustments(inventoryItemId, startDay, endDay) {
   const json = await shopifyGET(
     `inventory_items/${inventoryItemId}/inventory_levels`,
@@ -144,7 +139,6 @@ async function fetchAdjustments(inventoryItemId, startDay, endDay) {
       updated_at_min: `${startDay}T00:00:00Z`,
       updated_at_max: `${endDay}T23:59:59Z`,
     };
-
     if (pageInfo) params.page_info = pageInfo;
 
     const res = await shopifyGET(
@@ -171,113 +165,31 @@ async function fetchAdjustments(inventoryItemId, startDay, endDay) {
   return adjustments;
 }
 
-/* ---------- Step 3: Fetch orders (to calculate sold-on-days-in-stock) ---------- */
-async function fetchOrders(startDay, endDay) {
-  const output = [];
-  let pageInfo = null;
-
-  while (true) {
-    const params = {
-      limit: 250,
-      status: "any",
-      created_at_min: `${startDay}T00:00:00Z`,
-      created_at_max: `${endDay}T23:59:59Z`,
-    };
-
-    if (pageInfo) params.page_info = pageInfo;
-
-    const json = await shopifyGET("orders", params);
-
-    for (const o of json.orders || []) {
-      for (const li of o.line_items || []) {
-        if (!li.sku) continue;
-
-        output.push({
-          date: o.created_at.slice(0, 10),
-          sku: li.sku,
-          qty: li.quantity,
-        });
-      }
-    }
-
-    const link = json.headers?.link || "";
-    if (!link.includes('rel="next"')) break;
-
-    const match = link.match(/page_info=([^&>]+)/);
-    if (!match) break;
-
-    pageInfo = match[1];
-  }
-
-  return output;
-}
-
-/* ---------- Step 4: Build daily stock levels ---------- */
+/* ---------- Step 3: Reconstruct daily levels ---------- */
 function reconstructDailyLevels(startDay, endDay, adjustments) {
   const days = enumerateDays(new Date(startDay), new Date(endDay));
-  const daily = {};
-  let running = 0;
+  const map = {};
 
-  for (const d of days) daily[d] = 0;
-  for (const adj of adjustments) {
-    if (!daily[adj.date]) continue;
-    daily[adj.date] += adj.delta;
-  }
+  days.forEach((d) => (map[d] = 0));
 
-  return daily;
-}
-
-/* ---------- Step 5: Build metrics per SKU ---------- */
-function calculateMetrics(variants, invMapByItem, orders, startDay, endDay) {
-  const days = enumerateDays(new Date(startDay), new Date(endDay));
-
-  const ordersByDateSku = {};
-  for (const o of orders) {
-    const key = `${o.date}|${o.sku}`;
-    ordersByDateSku[key] = (ordersByDateSku[key] || 0) + o.qty;
-  }
-
-  const output = {};
-
-  for (const v of variants) {
-    const sku = v.sku;
-    const invDaily = invMapByItem[v.inventoryItemId] || {};
-    let daysInStock = 0;
-    let stockoutDays = 0;
-    let totalSold = 0;
-    let soldWhileInStock = 0;
-
-    for (const d of days) {
-      const qty = invDaily[d] ?? 0;
-      const sold = ordersByDateSku[`${d}|${sku}`] || 0;
-
-      totalSold += sold;
-
-      if (qty > 0) {
-        daysInStock++;
-        soldWhileInStock += sold;
-      } else {
-        stockoutDays++;
-      }
+  adjustments.forEach((a) => {
+    if (map[a.date] !== undefined) {
+      map[a.date] += a.delta;
     }
+  });
 
-    output[sku] = {
-      sku,
-      total_sold: totalSold,
-      sold_while_in_stock: soldWhileInStock,
-      days_in_stock: daysInStock,
-      stockout_days: stockoutDays,
-      daily: invDaily,
-    };
-  }
-
-  return output;
+  return map;
 }
 
-/* =====================================================================
-   MAIN HANDLER
-===================================================================== */
+/* ---------- Main Handler ---------- */
 module.exports = async (req, res) => {
+  // ******** SAFE DEBUG LOGS ********
+  console.log("DEBUG ENV VARS:", {
+    STORE_DOMAIN,
+    ADMIN_TOKEN,
+    API_VERSION
+  });
+
   if (applyCors(req, res)) return;
   applyCache(res);
 
@@ -307,22 +219,15 @@ module.exports = async (req, res) => {
       );
     }
 
-    const orders = await fetchOrders(startDay, endDay);
-
-    const results = calculateMetrics(
-      variants,
-      invMapByItem,
-      orders,
-      startDay,
-      endDay
-    );
-
     return res.status(200).json({
       ok: true,
-      range_months: months,
-      start_date: startDay,
-      end_date: endDay,
-      items: results,
+      months,
+      startDay,
+      endDay,
+      diagnostics: {
+        variants: variants.length,
+        inventoryItems: Object.keys(invMapByItem).length,
+      }
     });
   } catch (err) {
     console.error("Inventory report error:", err);
