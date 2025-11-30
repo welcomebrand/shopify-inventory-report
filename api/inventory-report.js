@@ -1,11 +1,7 @@
 /* =====================================================================
-   Shopify Inventory Report API (Simple Daily Reconstruction)
-   - Fully REST compliant
-   - Calculates:
-       • days in stock
-       • stockout days
-       • total sold
-       • sold while in stock
+   Shopify Inventory Report API (v4)
+   - Simple daily reconstruction
+   - SKU normalisation matches your sales API logic
 ===================================================================== */
 
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
@@ -30,6 +26,17 @@ function applyCache(res) {
     "Cache-Control",
     "s-maxage=14400, stale-while-revalidate=86400"
   );
+}
+
+/* ---------- SKU Normalisation (Matches Knife Sales Stats API) ---------- */
+function normalizeSku(sku) {
+  if (!sku) return null;
+
+  // Keep literal "-##" SKUs unchanged
+  if (sku.endsWith("-##")) return sku.trim();
+
+  // Strip variant numbers e.g. "-135", "-210", "-240" etc.
+  return sku.replace(/-\d+$/, "").trim();
 }
 
 /* ---------- Date Helpers ---------- */
@@ -63,9 +70,11 @@ async function shopifyGET(path, params = {}) {
     `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/${path}.json`
   );
 
-  Object.keys(params).forEach((k) =>
-    url.searchParams.append(k, params[k])
-  );
+  Object.keys(params).forEach((k) => {
+    if (params[k] !== undefined && params[k] !== null) {
+      url.searchParams.append(k, params[k]);
+    }
+  });
 
   const res = await fetch(url, {
     headers: {
@@ -76,9 +85,7 @@ async function shopifyGET(path, params = {}) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(
-      `REST ${res.status}: ${txt}`
-    );
+    throw new Error(`REST ${res.status}: ${txt}`);
   }
 
   return res.json();
@@ -103,7 +110,8 @@ async function fetchVariants() {
       for (const v of product.variants || []) {
         if (v.sku && v.inventory_item_id) {
           variants.push({
-            sku: v.sku,
+            rawSku: v.sku,
+            sku: normalizeSku(v.sku),
             variantId: v.id,
             inventoryItemId: v.inventory_item_id
           });
@@ -121,7 +129,7 @@ async function fetchVariants() {
   return variants;
 }
 
-/* ---------- 2. Fetch current inventory level (today) ---------- */
+/* ---------- 2. Fetch current quantity ---------- */
 async function fetchCurrentLevel(inventoryItemId) {
   const json = await shopifyGET("inventory_levels", {
     inventory_item_ids: inventoryItemId
@@ -132,7 +140,7 @@ async function fetchCurrentLevel(inventoryItemId) {
   return json.inventory_levels[0].available || 0;
 }
 
-/* ---------- 3. Fetch sales in date range ---------- */
+/* ---------- 3. Fetch orders and sales by SKU ---------- */
 async function fetchOrders(startDay, endDay) {
   const sales = [];
   let cursor = null;
@@ -155,7 +163,8 @@ async function fetchOrders(startDay, endDay) {
         if (!li.sku) continue;
         sales.push({
           date,
-          sku: li.sku,
+          rawSku: li.sku,
+          sku: normalizeSku(li.sku),
           qty: li.quantity
         });
       }
@@ -171,39 +180,32 @@ async function fetchOrders(startDay, endDay) {
   return sales;
 }
 
-/* ---------- 4. Reconstruct daily inventory (simple model) ---------- */
-function reconstructDailyInventory(startDay, endDay, finalQty, salesForSku) {
+/* ---------- 4. Simple Daily Reconstruction ---------- */
+function reconstructDailyInventory(startDay, endDay, finalQty, salesMap) {
   const days = enumerateDays(startDay, endDay);
-
-  // Initialise all as zero stock
   const inventory = {};
-  days.forEach((d) => (inventory[d] = 0));
-
-  // Assume the final day stock is correct
   let running = finalQty;
 
-  // Work backwards for each day
   for (let i = days.length - 1; i >= 0; i--) {
     const day = days[i];
-    const sold = salesForSku[day] || 0;
-
+    const sold = salesMap[day] || 0;
     inventory[day] = running;
-    running += sold; // simple reconstruction: add back what sold that day
+    running += sold; // rewind by adding sales
   }
 
   return inventory;
 }
 
-/* ---------- 5. Calculate Metrics ---------- */
-function calculateMetrics(inventory, salesForSku) {
+/* ---------- 5. Metrics ---------- */
+function calculateMetrics(inventory, salesMap) {
   let daysInStock = 0;
   let stockoutDays = 0;
-  let totalSold = 0;
   let soldWhileInStock = 0;
+  let totalSold = 0;
 
   for (const day of Object.keys(inventory)) {
     const qty = inventory[day];
-    const sold = salesForSku[day] || 0;
+    const sold = salesMap[day] || 0;
     totalSold += sold;
 
     if (qty > 0) {
@@ -237,7 +239,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const { startDay, endDay, start, end, months } = getRange(req.query.range);
+    const { startDay, endDay, months } = getRange(req.query.range);
 
     const variants = await fetchVariants();
     const orders = await fetchOrders(startDay, endDay);
@@ -245,25 +247,23 @@ module.exports = async (req, res) => {
     const output = {};
 
     for (const v of variants) {
+      const sku = v.sku;
+
       // Build sales map for this SKU
       const salesMap = {};
       for (const o of orders) {
-        if (o.sku === v.sku) {
+        if (o.sku === sku) {
           salesMap[o.date] = (salesMap[o.date] || 0) + o.qty;
         }
       }
 
-      // Final known stock today
       const finalQty = await fetchCurrentLevel(v.inventoryItemId);
 
-      // Reconstruct daily inventory
       const inventory = reconstructDailyInventory(startDay, endDay, finalQty, salesMap);
-
-      // Metrics
       const metrics = calculateMetrics(inventory, salesMap);
 
-      output[v.sku] = {
-        sku: v.sku,
+      output[sku] = {
+        sku: sku,
         ...metrics
       };
     }
