@@ -6,6 +6,13 @@
    - Safe for all Shopify plans and API versions
 ===================================================================== */
 
+console.log("DEBUG ENV VARS:", {
+  STORE_DOMAIN: process.env.SHOPIFY_STORE_DOMAIN,
+  ADMIN_TOKEN: process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+  API_VERSION: process.env.SHOPIFY_API_VERSION
+});
+
+
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
