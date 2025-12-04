@@ -1,6 +1,3 @@
-const fetch = (...args) =>
-  import('node-fetch').then(({ default: fetch }) => fetch(...args));
-
 export default async function handler(req, res) {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
   const token = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
@@ -24,6 +21,15 @@ export default async function handler(req, res) {
       }
     });
 
+    if (!response.ok) {
+      const text = await response.text();
+      return res.status(response.status).json({
+        ok: false,
+        response_error: text,
+        status: response.status
+      });
+    }
+
     const data = await response.json();
 
     return res.status(200).json({
@@ -31,8 +37,9 @@ export default async function handler(req, res) {
       domain,
       apiVersion,
       result: data,
-      note: "If count > 0, next we test full order fetch."
+      note: "If count > 0, we can proceed to full order pull"
     });
+
   } catch (err) {
     return res.status(500).json({
       ok: false,
